@@ -3,6 +3,7 @@ use ratatui::DefaultTerminal;
 use std::io;
 
 use crate::file::parquet_ctx::ParquetCtx;
+use crate::file::sample_data::{SortOrder, SortSpec};
 use crate::tabs::TabManager;
 
 pub struct AppRenderView<'a> {
@@ -54,6 +55,12 @@ pub struct AppState {
     // Upper bound for `horizontal_offset`, recomputed each frame from the
     // on-screen column count. Prevents scrolling past the last visible column.
     max_horizontal_offset: usize,
+    // Visualize tab: in column mode Left/Right move `selected_column` instead
+    // of scrolling.
+    column_mode: bool,
+    selected_column: usize,
+    num_columns: usize,
+    sort: Option<SortSpec>,
 }
 
 impl Default for AppState {
@@ -71,14 +78,20 @@ impl AppState {
             data_vertical_scroll: 0,
             visible_data_rows: 20, // Default fallback
             max_horizontal_offset: usize::MAX,
+            column_mode: false,
+            selected_column: 0,
+            num_columns: 0,
+            sort: None,
         }
     }
 
+    /// Resets navigation; an active sort is kept.
     pub fn reset(&mut self) {
         self.horizontal_offset = 0;
         self.vertical_offset = 0;
         self.tree_scroll_offset = 0;
         self.data_vertical_scroll = 0;
+        self.column_mode = false;
     }
 
     pub fn horizontal_offset(&self) -> usize {
@@ -110,6 +123,71 @@ impl AppState {
     pub fn set_max_horizontal_offset(&mut self, max: usize) {
         self.max_horizontal_offset = max;
         self.horizontal_offset = self.horizontal_offset.min(max);
+    }
+
+    pub fn set_horizontal_offset(&mut self, offset: usize) {
+        self.horizontal_offset = offset.min(self.max_horizontal_offset);
+    }
+
+    pub fn column_mode(&self) -> bool {
+        self.column_mode
+    }
+
+    /// Entering column mode selects the first column on screen.
+    pub fn toggle_column_mode(&mut self) {
+        self.column_mode = !self.column_mode;
+        if self.column_mode {
+            self.selected_column = self.horizontal_offset;
+        }
+    }
+
+    pub fn selected_column(&self) -> usize {
+        self.selected_column
+    }
+
+    pub fn set_num_columns(&mut self, num_columns: usize) {
+        self.num_columns = num_columns;
+        self.selected_column = self.selected_column.min(num_columns.saturating_sub(1));
+    }
+
+    pub fn select_next_column(&mut self) {
+        self.selected_column = (self.selected_column + 1).min(self.num_columns.saturating_sub(1));
+    }
+
+    pub fn select_prev_column(&mut self) {
+        self.selected_column = self.selected_column.saturating_sub(1);
+    }
+
+    pub fn sort(&self) -> Option<SortSpec> {
+        self.sort
+    }
+
+    pub fn clear_sort(&mut self) {
+        self.sort = None;
+    }
+
+    /// Cycle the selected column through descending -> ascending -> file order.
+    /// Choosing another column starts it at descending.
+    pub fn cycle_sort(&mut self) {
+        let column = self.selected_column;
+        self.sort = match self.sort {
+            Some(SortSpec {
+                column: sorted,
+                order: SortOrder::Descending,
+            }) if sorted == column => Some(SortSpec {
+                column,
+                order: SortOrder::Ascending,
+            }),
+            Some(SortSpec {
+                column: sorted,
+                order: SortOrder::Ascending,
+            }) if sorted == column => None,
+            _ => Some(SortSpec {
+                column,
+                order: SortOrder::Descending,
+            }),
+        };
+        self.jump_to_top();
     }
 
     pub fn tree_scroll_offset(&self) -> usize {
@@ -211,27 +289,42 @@ impl<'a> App<'a> {
             let visible_data_rows = (terminal_size.height.saturating_sub(7) as usize).max(1);
             self.state.set_visible_data_rows(visible_data_rows);
 
-            // Lazily (re)load the row window backing the Visualize table so only a
-            // bounded slice of a large file is ever held in memory.
-            if self.tabs.active_tab().to_string() == "Visualize" {
-                self.parquet_ctx
-                    .sample_data
-                    .ensure_loaded(self.state.data_vertical_scroll(), visible_data_rows);
+            let is_visualize = self.tabs.active_tab().to_string() == "Visualize";
+            let sample_data = &self.parquet_ctx.sample_data;
+
+            if is_visualize {
+                self.state.set_num_columns(sample_data.total_columns);
+                // Some column types (e.g. structs) cannot be sorted; drop the
+                // request so the table keeps its current order.
+                if sample_data.set_sort(self.state.sort()).is_err() {
+                    self.state.clear_sort();
+                }
+                // Lazily (re)load the row window backing the Visualize table so only a
+                // bounded slice of a large file is ever held in memory.
+                sample_data.ensure_loaded(self.state.data_vertical_scroll(), visible_data_rows);
             }
 
             // Bound visualize horizontal scrolling to what fits.
             // terminal minus the tab header (3 lines) and footer (1 line).
-            let max_horizontal_offset = if self.tabs.active_tab().to_string() == "Visualize" {
-                crate::components::DataTable::new(&self.parquet_ctx.sample_data)
-                    .with_vertical_scroll(self.state.data_vertical_scroll())
-                    .max_horizontal_scroll(
-                        terminal_size.width,
-                        terminal_size.height.saturating_sub(4),
-                    )
+            let table_height = terminal_size.height.saturating_sub(4);
+            let table = crate::components::DataTable::new(sample_data)
+                .with_vertical_scroll(self.state.data_vertical_scroll());
+            let max_horizontal_offset = if is_visualize {
+                table.max_horizontal_scroll(terminal_size.width, table_height)
             } else {
                 usize::MAX
             };
             self.state.set_max_horizontal_offset(max_horizontal_offset);
+
+            if is_visualize && self.state.column_mode() {
+                let offset = table.horizontal_scroll_showing(
+                    self.state.selected_column(),
+                    self.state.horizontal_offset(),
+                    terminal_size.width,
+                    table_height,
+                );
+                self.state.set_horizontal_offset(offset);
+            }
 
             let render_view = AppRenderView::from_app(self);
             terminal.draw(|frame| crate::ui::render_app(&render_view, frame))?;
@@ -315,6 +408,61 @@ mod tests {
         state.jump_to_top();
         assert_eq!(state.vertical_offset(), 0);
         assert_eq!(state.data_vertical_scroll(), 0);
+    }
+
+    #[test]
+    fn test_cycle_sort_goes_descending_ascending_then_off() {
+        let mut state = AppState::new();
+        state.set_num_columns(5);
+        state.toggle_column_mode();
+        state.select_next_column();
+
+        state.cycle_sort();
+        assert_eq!(
+            state.sort(),
+            Some(SortSpec {
+                column: 1,
+                order: SortOrder::Descending
+            })
+        );
+        state.cycle_sort();
+        assert_eq!(
+            state.sort(),
+            Some(SortSpec {
+                column: 1,
+                order: SortOrder::Ascending
+            })
+        );
+        state.cycle_sort();
+        assert_eq!(state.sort(), None);
+    }
+
+    #[test]
+    fn test_sorting_another_column_starts_descending() {
+        let mut state = AppState::new();
+        state.set_num_columns(5);
+        state.toggle_column_mode();
+        state.cycle_sort();
+        state.cycle_sort();
+        state.select_next_column();
+        state.cycle_sort();
+        assert_eq!(
+            state.sort(),
+            Some(SortSpec {
+                column: 1,
+                order: SortOrder::Descending
+            })
+        );
+    }
+
+    #[test]
+    fn test_selected_column_is_clamped_to_the_column_count() {
+        let mut state = AppState::new();
+        state.set_num_columns(2);
+        for _ in 0..5 {
+            state.select_next_column();
+        }
+        assert_eq!(state.selected_column(), 1);
     }
 
     #[test]

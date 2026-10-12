@@ -73,6 +73,11 @@ impl Tab for VisualizeTab {
             KeyCode::Char('G') | KeyCode::End => {
                 state.jump_to_bottom(visible_rows, max_rows);
             }
+            KeyCode::Char('M') => state.toggle_column_mode(),
+            KeyCode::Char('s') if state.column_mode() => state.cycle_sort(),
+            // In column mode the arrows pick the column; scrolling follows it.
+            KeyCode::Left if state.column_mode() => state.select_prev_column(),
+            KeyCode::Right if state.column_mode() => state.select_next_column(),
             // Column navigation (Left/Right arrows)
             KeyCode::Left if state.horizontal_offset() > 0 => state.left(),
             // Upper bound is enforced in AppState against the on-screen column
@@ -108,6 +113,14 @@ impl Tab for VisualizeTab {
             "G".blue(),
             " : ".into(),
             "Top/Bottom".into(),
+            " | ".white(),
+            "M".green(),
+            " : ".into(),
+            "Column mode".into(),
+            " | ".white(),
+            "s".green(),
+            " : ".into(),
+            "Sort".into(),
         ]
     }
 
