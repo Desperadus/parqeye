@@ -2,6 +2,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::DefaultTerminal;
 use std::io;
 
+use crate::components::column_graph::{self, GraphSettings};
 use crate::file::parquet_ctx::ParquetCtx;
 use crate::file::sample_data::{SortOrder, SortSpec};
 use crate::tabs::TabManager;
@@ -61,6 +62,9 @@ pub struct AppState {
     selected_column: usize,
     num_columns: usize,
     sort: Option<SortSpec>,
+    // Distribution graph of `selected_column`, opened from column mode.
+    graph_open: bool,
+    graph: GraphSettings,
 }
 
 impl Default for AppState {
@@ -82,6 +86,8 @@ impl AppState {
             selected_column: 0,
             num_columns: 0,
             sort: None,
+            graph_open: false,
+            graph: GraphSettings::default(),
         }
     }
 
@@ -92,6 +98,7 @@ impl AppState {
         self.tree_scroll_offset = 0;
         self.data_vertical_scroll = 0;
         self.column_mode = false;
+        self.graph_open = false;
     }
 
     pub fn horizontal_offset(&self) -> usize {
@@ -156,6 +163,41 @@ impl AppState {
 
     pub fn select_prev_column(&mut self) {
         self.selected_column = self.selected_column.saturating_sub(1);
+    }
+
+    pub fn graph_open(&self) -> bool {
+        self.graph_open
+    }
+
+    pub fn graph(&self) -> &GraphSettings {
+        &self.graph
+    }
+
+    pub fn graph_mut(&mut self) -> &mut GraphSettings {
+        &mut self.graph
+    }
+
+    pub fn open_graph(&mut self) {
+        self.graph_open = true;
+        self.graph.reset_view();
+    }
+
+    /// Back to the table, still in column mode.
+    pub fn close_graph(&mut self) {
+        self.graph_open = false;
+    }
+
+    /// Move the graph to a neighbouring column; its view starts fresh.
+    pub fn graph_select_column(&mut self, forward: bool) {
+        let before = self.selected_column;
+        if forward {
+            self.select_next_column();
+        } else {
+            self.select_prev_column();
+        }
+        if self.selected_column != before {
+            self.graph.reset_view();
+        }
     }
 
     pub fn sort(&self) -> Option<SortSpec> {
@@ -304,6 +346,19 @@ impl<'a> App<'a> {
                 sample_data.ensure_loaded(self.state.data_vertical_scroll(), visible_data_rows);
             }
 
+            // No columns when polars couldn't read the file; the error screen shows instead.
+            if is_visualize && self.state.graph_open() && sample_data.total_columns > 0 {
+                let column = self.state.selected_column();
+                if sample_data.cached_profile(column).is_none() {
+                    // Reading a whole column can take a moment; show that first.
+                    let render_view = AppRenderView::from_app(self);
+                    terminal.draw(|frame| crate::ui::render_app(&render_view, frame))?;
+                }
+                let profile = sample_data.profile(column);
+                let bar_rows = column_graph::bar_rows(terminal_size.height.saturating_sub(4));
+                self.state.graph_mut().fit_to(&profile, bar_rows);
+            }
+
             // Bound visualize horizontal scrolling to what fits.
             // terminal minus the tab header (3 lines) and footer (1 line).
             let table_height = terminal_size.height.saturating_sub(4);
@@ -346,6 +401,7 @@ impl<'a> App<'a> {
     fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event.code {
             KeyCode::Char('q') | KeyCode::Char('Q') => self.exit(),
+            KeyCode::Esc if self.state.graph_open() => self.state.close_graph(),
             KeyCode::Esc => self.state.reset(),
             KeyCode::Tab => {
                 self.tabs.next();
@@ -453,6 +509,29 @@ mod tests {
                 order: SortOrder::Descending
             })
         );
+    }
+
+    #[test]
+    fn test_moving_the_graph_to_another_column_resets_its_view() {
+        let mut state = AppState::new();
+        state.set_num_columns(3);
+        state.toggle_column_mode();
+        state.open_graph();
+        state.graph_mut().log_x = true;
+        state.graph_select_column(true);
+        assert_eq!(state.selected_column(), 1);
+        assert!(!state.graph().log_x);
+    }
+
+    #[test]
+    fn test_graph_view_is_kept_at_the_last_column() {
+        let mut state = AppState::new();
+        state.set_num_columns(1);
+        state.toggle_column_mode();
+        state.open_graph();
+        state.graph_mut().log_x = true;
+        state.graph_select_column(true);
+        assert!(state.graph().log_x);
     }
 
     #[test]
