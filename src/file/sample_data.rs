@@ -7,6 +7,9 @@ type LoadedRows = (Vec<Vec<String>>, Vec<String>);
 
 const WINDOW_ROWS: usize = 2000;
 const ROW_PREFETCH: usize = 500;
+/// Temporary column holding each row's position in the file; named to avoid
+/// clashing with real columns.
+const ROW_ID_COLUMN: &str = "__parqeye_row_id";
 
 /// Serializes temporary replacement of the process-wide panic hook.
 static POLARS_PANIC_HOOK_LOCK: Mutex<()> = Mutex::new(());
@@ -25,6 +28,25 @@ impl RowWindow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    Descending,
+    Ascending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortSpec {
+    pub column: usize,
+    pub order: SortOrder,
+}
+
+/// An active sort: `row_ids[i]` is the file row shown at display position `i`.
+#[derive(Debug)]
+struct Sorting {
+    spec: SortSpec,
+    row_ids: Vec<IdxSize>,
+}
+
 /// A lazily-loaded, memory-bounded view over a parquet file's rows.
 #[derive(Debug, Default)]
 pub struct ParquetSampleData {
@@ -33,6 +55,7 @@ pub struct ParquetSampleData {
     pub total_columns: usize,
     pub total_rows: usize,
     window: RefCell<RowWindow>,
+    sorting: RefCell<Option<Sorting>>,
 }
 
 impl ParquetSampleData {
@@ -66,6 +89,7 @@ impl ParquetSampleData {
             flattened_columns: columns,
             total_rows,
             window: RefCell::new(RowWindow { start: 0, rows }),
+            sorting: RefCell::new(None),
         })
     }
 
@@ -87,8 +111,76 @@ impl ParquetSampleData {
         let df = LazyFrame::scan_parquet(PlRefPath::new(file_path), Default::default())?
             .slice(offset as i64, len as IdxSize)
             .collect()?;
-        let df = Self::flatten_struct_columns(df);
+        Ok(Self::to_rows(Self::flatten_struct_columns(df)))
+    }
 
+    /// Read the rows at the given file positions, returned in the order of `row_ids`.
+    fn load_by_row_ids(
+        file_path: &str,
+        row_ids: &[IdxSize],
+    ) -> Result<LoadedRows, Box<dyn std::error::Error>> {
+        let path = file_path.to_string();
+        let row_ids = row_ids.to_vec();
+        catch_polars_panic(move || Self::load_by_row_ids_with_polars(&path, &row_ids))
+    }
+
+    fn load_by_row_ids_with_polars(
+        file_path: &str,
+        row_ids: &[IdxSize],
+    ) -> Result<LoadedRows, Box<dyn std::error::Error>> {
+        let mut ids_in_file_order = row_ids.to_vec();
+        ids_in_file_order.sort_unstable();
+        let ids = Series::new(ROW_ID_COLUMN.into(), &ids_in_file_order);
+
+        // A filter rather than a join so the scan stays streaming instead of
+        // materializing the whole file.
+        let df = LazyFrame::scan_parquet(PlRefPath::new(file_path), Default::default())?
+            .with_row_index(ROW_ID_COLUMN, None)
+            .filter(col(ROW_ID_COLUMN).is_in(lit(ids).implode(false), false))
+            .collect()?
+            .drop(ROW_ID_COLUMN)?;
+
+        let positions: Vec<IdxSize> = row_ids
+            .iter()
+            .map(|id| ids_in_file_order.binary_search(id).unwrap() as IdxSize)
+            .collect();
+        let df = df.take(&IdxCa::from_vec(PlSmallStr::EMPTY, positions))?;
+        Ok(Self::to_rows(Self::flatten_struct_columns(df)))
+    }
+
+    /// File row positions ordered by `column`; only that column is read.
+    fn sorted_row_ids(
+        file_path: &str,
+        column: &str,
+        order: SortOrder,
+    ) -> Result<Vec<IdxSize>, Box<dyn std::error::Error>> {
+        let path = file_path.to_string();
+        let column = column.to_string();
+        catch_polars_panic(move || Self::sorted_row_ids_with_polars(&path, &column, order))
+    }
+
+    fn sorted_row_ids_with_polars(
+        file_path: &str,
+        column: &str,
+        order: SortOrder,
+    ) -> Result<Vec<IdxSize>, Box<dyn std::error::Error>> {
+        let options = SortMultipleOptions::default()
+            .with_order_descending(order == SortOrder::Descending)
+            .with_nulls_last(true)
+            .with_maintain_order(true);
+        let df = LazyFrame::scan_parquet(PlRefPath::new(file_path), Default::default())?
+            .with_row_index(ROW_ID_COLUMN, None)
+            .select([col(ROW_ID_COLUMN), col(column)])
+            .sort([column], options)
+            .collect()?;
+        Ok(df
+            .column(ROW_ID_COLUMN)?
+            .idx()?
+            .into_no_null_iter()
+            .collect())
+    }
+
+    fn to_rows(df: DataFrame) -> LoadedRows {
         let columns: Vec<String> = df
             .get_column_names()
             .iter()
@@ -105,7 +197,32 @@ impl ParquetSampleData {
             rows.push(row);
         }
 
-        Ok((rows, columns))
+        (rows, columns)
+    }
+
+    pub fn sort(&self) -> Option<SortSpec> {
+        self.sorting.borrow().as_ref().map(|sorting| sorting.spec)
+    }
+
+    /// Apply `spec` (or restore file order with `None`). On error the previous
+    /// order is kept.
+    pub fn set_sort(&self, spec: Option<SortSpec>) -> Result<(), Box<dyn std::error::Error>> {
+        if self.sort() == spec {
+            return Ok(());
+        }
+
+        let sorting = match spec {
+            Some(spec) => {
+                let column = &self.flattened_columns[spec.column];
+                let row_ids = Self::sorted_row_ids(&self.file_path, column, spec.order)?;
+                Some(Sorting { spec, row_ids })
+            }
+            None => None,
+        };
+        *self.sorting.borrow_mut() = sorting;
+        // Invalidate so the next `ensure_loaded` reads rows in the new order.
+        *self.window.borrow_mut() = RowWindow::default();
+        Ok(())
     }
 
     /// Reload the bounded window when the requested viewport is outside it.
@@ -121,7 +238,14 @@ impl ParquetSampleData {
             return;
         }
 
-        if let Ok((rows, _columns)) = Self::load(&self.file_path, new_start, len) {
+        let loaded = match self.sorting.borrow().as_ref() {
+            Some(sorting) => Self::load_by_row_ids(
+                &self.file_path,
+                &sorting.row_ids[new_start..new_start + len],
+            ),
+            None => Self::load(&self.file_path, new_start, len),
+        };
+        if let Ok((rows, _columns)) = loaded {
             let mut window = self.window.borrow_mut();
             window.start = new_start;
             window.rows = rows;
@@ -220,6 +344,66 @@ mod tests {
         let win = data.loaded();
         let rel = 6000 - win.start;
         assert_eq!(&win.rows[rel..rel + 10], &direct[..]);
+    }
+
+    fn sort_spec(data: &ParquetSampleData, column: &str, order: SortOrder) -> SortSpec {
+        let column = data
+            .flattened_columns
+            .iter()
+            .position(|name| name == column)
+            .unwrap();
+        SortSpec { column, order }
+    }
+
+    fn ids(data: &ParquetSampleData, view_start: usize, len: usize) -> Vec<i64> {
+        data.ensure_loaded(view_start, len);
+        let win = data.loaded();
+        let id_col = data
+            .flattened_columns
+            .iter()
+            .position(|c| c == "id")
+            .unwrap();
+        let rel = view_start - win.start;
+        win.rows[rel..rel + len]
+            .iter()
+            .map(|row| row[id_col].parse().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn sorting_descending_then_ascending_then_back_to_file_order() {
+        let data = ParquetSampleData::open(&wide_file(), 7300).unwrap();
+        let file_order = ids(&data, 0, 5);
+
+        data.set_sort(Some(sort_spec(&data, "id", SortOrder::Descending)))
+            .unwrap();
+        assert_eq!(ids(&data, 0, 3), vec![7299, 7298, 7297]);
+
+        data.set_sort(Some(sort_spec(&data, "id", SortOrder::Ascending)))
+            .unwrap();
+        assert_eq!(ids(&data, 0, 3), vec![0, 1, 2]);
+
+        data.set_sort(None).unwrap();
+        assert_eq!(ids(&data, 0, 5), file_order);
+    }
+
+    #[test]
+    fn sorted_order_holds_past_the_first_window() {
+        let data = ParquetSampleData::open(&wide_file(), 7300).unwrap();
+        data.set_sort(Some(sort_spec(&data, "id", SortOrder::Descending)))
+            .unwrap();
+        assert_eq!(ids(&data, 6000, 3), vec![1299, 1298, 1297]);
+    }
+
+    #[test]
+    fn sorting_by_a_column_with_ties_keeps_file_order_within_ties() {
+        let data = ParquetSampleData::open(&wide_file(), 7300).unwrap();
+        data.set_sort(Some(sort_spec(&data, "bool_col", SortOrder::Descending)))
+            .unwrap();
+        let sorting = data.sorting.borrow();
+        // bool_col alternates, so the first half is every "true" row.
+        let trues = &sorting.as_ref().unwrap().row_ids[..3650];
+        assert!(trues.windows(2).all(|w| w[0] < w[1]));
     }
 
     fn write_geoarrow_wkb_file() -> std::path::PathBuf {

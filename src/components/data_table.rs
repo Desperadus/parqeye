@@ -1,4 +1,4 @@
-use crate::file::sample_data::ParquetSampleData;
+use crate::file::sample_data::{ParquetSampleData, SortOrder};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -18,6 +18,8 @@ const NUM_SPACES_AFTER_LINE_NUMBER: u16 = 2;
 const MIN_ROW_NUM_DIGITS: u16 = 4;
 /// Header text line plus the separator line above the first data row.
 const HEADER_HEIGHT: u16 = 2;
+const SORT_DESCENDING_MARKER: &str = " ▼";
+const SORT_ASCENDING_MARKER: &str = " ▲";
 
 /// Digits needed for the largest row number currently in view.
 fn row_num_digits(vertical_scroll: usize, rows_height: u16, total_rows: usize) -> u16 {
@@ -59,6 +61,17 @@ fn max_scroll_from_widths(widths: &[u16], available_width: u16) -> usize {
     widths.len().saturating_sub(fit.max(1))
 }
 
+/// Smallest change to `current` scroll that puts `column` on screen.
+fn scroll_showing(widths: &[u16], column: usize, current: usize, available_width: u16) -> usize {
+    let max_scroll = max_scroll_from_widths(widths, available_width);
+    let mut scroll = current.min(column).min(max_scroll);
+    while scroll < max_scroll && column >= scroll + columns_fitting(widths, scroll, available_width)
+    {
+        scroll += 1;
+    }
+    scroll
+}
+
 pub struct DataTable<'a> {
     pub data: &'a ParquetSampleData,
     pub title: String,
@@ -67,6 +80,7 @@ pub struct DataTable<'a> {
     pub horizontal_scroll: usize,
     pub vertical_scroll: usize,
     pub selected_row: Option<usize>,
+    pub selected_column: Option<usize>,
     pub selected_color: Color,
     pub border_color: Color,
 }
@@ -81,6 +95,7 @@ impl<'a> DataTable<'a> {
             horizontal_scroll: 0,
             vertical_scroll: 0,
             selected_row: None,
+            selected_column: None,
             selected_color: Color::Rgb(60, 60, 60),
             border_color: Color::DarkGray,
         }
@@ -117,6 +132,11 @@ impl<'a> DataTable<'a> {
         self
     }
 
+    pub fn with_selected_column(mut self, column: Option<usize>) -> Self {
+        self.selected_column = column;
+        self
+    }
+
     pub fn scroll_left(&mut self) {
         if self.horizontal_scroll > 0 {
             self.horizontal_scroll -= 1;
@@ -140,6 +160,26 @@ impl<'a> DataTable<'a> {
         self.data.total_columns.saturating_sub(max_visible_columns)
     }
 
+    /// Column names, with a direction marker on the sorted column.
+    fn header_labels(&self) -> Vec<String> {
+        let sort = self.data.sort();
+        self.data
+            .flattened_columns
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| match sort {
+                Some(spec) if spec.column == idx => {
+                    let marker = match spec.order {
+                        SortOrder::Descending => SORT_DESCENDING_MARKER,
+                        SortOrder::Ascending => SORT_ASCENDING_MARKER,
+                    };
+                    format!("{name}{marker}")
+                }
+                _ => name.clone(),
+            })
+            .collect()
+    }
+
     /// Rendered width of every column (from the rows in view). Basis for both the
     /// scroll bound and how many columns are drawn, so they stay in agreement.
     fn all_column_widths(&self) -> Vec<u16> {
@@ -148,7 +188,13 @@ impl<'a> DataTable<'a> {
             .vertical_scroll
             .saturating_sub(win.start)
             .min(win.rows.len());
-        self.calculate_column_widths(&self.data.flattened_columns, &win.rows[start..])
+        self.calculate_column_widths(&self.header_labels(), &win.rows[start..])
+    }
+
+    fn available_width(&self, area_width: u16, area_height: u16) -> u16 {
+        let row_num_section_width =
+            self.row_num_digits(area_height) + 2 * NUM_SPACES_AFTER_LINE_NUMBER + 1;
+        area_width.saturating_sub(row_num_section_width)
     }
 
     /// Digits in the row number gutter for a render area `area_height` tall.
@@ -163,10 +209,26 @@ impl<'a> DataTable<'a> {
     /// Maximum horizontal scroll offset for a render area; the last column is
     /// always reachable.
     pub fn max_horizontal_scroll(&self, area_width: u16, area_height: u16) -> usize {
-        let row_num_section_width =
-            self.row_num_digits(area_height) + 2 * NUM_SPACES_AFTER_LINE_NUMBER + 1;
-        let available_width = area_width.saturating_sub(row_num_section_width);
-        max_scroll_from_widths(&self.all_column_widths(), available_width)
+        max_scroll_from_widths(
+            &self.all_column_widths(),
+            self.available_width(area_width, area_height),
+        )
+    }
+
+    /// Horizontal scroll offset closest to `current` at which `column` is visible.
+    pub fn horizontal_scroll_showing(
+        &self,
+        column: usize,
+        current: usize,
+        area_width: u16,
+        area_height: u16,
+    ) -> usize {
+        scroll_showing(
+            &self.all_column_widths(),
+            column,
+            current,
+            self.available_width(area_width, area_height),
+        )
     }
 
     fn calculate_column_widths(
@@ -177,7 +239,7 @@ impl<'a> DataTable<'a> {
         let mut widths = Vec::new();
 
         for (col_idx, header) in headers.iter().enumerate() {
-            let mut max_width = header.len();
+            let mut max_width = header.chars().count();
 
             // Check content width for this column
             for row in visible_rows {
@@ -236,6 +298,7 @@ impl<'a> DataTable<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_header(
         &self,
         buf: &mut Buffer,
@@ -244,27 +307,34 @@ impl<'a> DataTable<'a> {
         headers: &[String],
         column_widths: &[u16],
         max_width: u16,
+        first_column: usize,
     ) {
         let mut x_offset = x_start;
 
-        for (header, &width) in headers.iter().zip(column_widths) {
+        for (idx, (header, &width)) in headers.iter().zip(column_widths).enumerate() {
             if x_offset >= max_width {
                 break;
             }
 
-            let effective_width = width.saturating_sub(NUM_SPACES_BETWEEN_COLUMNS);
-            let truncated = if header.len() > effective_width as usize {
-                format!(
-                    "{}...",
-                    &header[..effective_width.saturating_sub(3) as usize]
-                )
+            // Truncate on chars: byte slicing panics on non-ASCII names and the
+            // sort marker.
+            let effective_width = width.saturating_sub(NUM_SPACES_BETWEEN_COLUMNS) as usize;
+            let truncated = if header.chars().count() > effective_width {
+                let kept: String = header
+                    .chars()
+                    .take(effective_width.saturating_sub(3))
+                    .collect();
+                format!("{kept}...")
             } else {
                 header.clone()
             };
 
-            let style = ratatui::style::Style::default()
+            let mut style = ratatui::style::Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD);
+            if self.selected_column == Some(first_column + idx) {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
             let span = Span::styled(truncated, style);
 
             buf.set_span(x_offset, y, &span, width);
@@ -350,8 +420,7 @@ impl<'a> Widget for DataTable<'a> {
         let row_num_section_width = max_row_num_length + 2 * NUM_SPACES_AFTER_LINE_NUMBER + 1;
         let x_row_separator = max_row_num_length + NUM_SPACES_AFTER_LINE_NUMBER + 1;
 
-        // Calculate available width for data columns
-        let available_width = area.width.saturating_sub(row_num_section_width);
+        let available_width = self.available_width(area.width, area.height);
 
         // Clamp scroll to the actual end (last column flush right), then show as
         // many columns as truly fit from there. Sizing by real column widths
@@ -364,12 +433,10 @@ impl<'a> Widget for DataTable<'a> {
 
         // Get visible columns
         let visible_headers: Vec<String> = self
-            .data
-            .flattened_columns
-            .iter()
+            .header_labels()
+            .into_iter()
             .skip(horizontal_scroll)
             .take(max_visible_columns)
-            .cloned()
             .collect();
 
         // Get visible data for each row (apply vertical scroll). Rows live in a
@@ -414,6 +481,7 @@ impl<'a> Widget for DataTable<'a> {
             &visible_headers,
             &column_widths,
             area.width,
+            horizontal_scroll,
         );
 
         // Render header separator (horizontal line below headers)
@@ -498,6 +566,26 @@ mod tests {
     fn test_max_scroll_with_a_wide_trailing_column() {
         // Only the last (over-wide) column fits from the right.
         assert_eq!(max_scroll_from_widths(&[10, 10, 50], 30), 2);
+    }
+
+    #[test]
+    fn test_scroll_showing_keeps_a_visible_column_in_place() {
+        let widths = [10, 10, 10, 10, 10];
+        assert_eq!(scroll_showing(&widths, 2, 1, 25), 1);
+    }
+
+    #[test]
+    fn test_scroll_showing_scrolls_right_just_enough() {
+        // Two columns fit; showing column 3 from offset 0 needs offset 2.
+        let widths = [10, 10, 10, 10, 10];
+        assert_eq!(scroll_showing(&widths, 3, 0, 25), 2);
+        assert_eq!(scroll_showing(&widths, 4, 0, 25), 3);
+    }
+
+    #[test]
+    fn test_scroll_showing_scrolls_left_to_the_column() {
+        let widths = [10, 10, 10, 10, 10];
+        assert_eq!(scroll_showing(&widths, 1, 3, 25), 1);
     }
 
     #[test]

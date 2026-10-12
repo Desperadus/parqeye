@@ -262,6 +262,12 @@ impl<'a> AppWidget<'a> {
             .with_horizontal_scroll(self.0.state().horizontal_offset())
             .with_vertical_scroll(self.0.state().data_vertical_scroll())
             .with_selected_row(Some(self.0.state().vertical_offset()))
+            .with_selected_column(
+                self.0
+                    .state()
+                    .column_mode()
+                    .then(|| self.0.state().selected_column()),
+            )
             .render(area, buf)
     }
 }
