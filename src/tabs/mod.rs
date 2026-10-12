@@ -16,6 +16,6 @@ use std::io;
 
 pub trait Tab {
     fn on_event(&self, key_event: KeyEvent, state: &mut AppState) -> Result<(), io::Error>;
-    fn instructions(&self) -> Vec<Span<'static>>;
+    fn instructions(&self, state: &AppState) -> Vec<Span<'static>>;
     fn to_string(&self) -> String;
 }

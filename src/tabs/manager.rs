@@ -1,3 +1,4 @@
+use crate::app::AppState;
 use crate::file::Renderable;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -64,8 +65,8 @@ impl TabManager {
         &self.tabs[self.active_tab]
     }
 
-    pub fn render_instructions(&self, area: Rect, buf: &mut Buffer) {
-        let mut span = self.active_tab().instructions();
+    pub fn render_instructions(&self, area: Rect, buf: &mut Buffer, state: &AppState) {
+        let mut span = self.active_tab().instructions(state);
         if !span.is_empty() {
             span.push(" - ".into());
         }

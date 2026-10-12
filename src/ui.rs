@@ -9,8 +9,9 @@ use ratatui::{
 };
 
 use crate::app::AppRenderView;
+use crate::components::column_graph::render_loading;
 use crate::components::{
-    DataTable, FileSchemaTable, RowGroupColumnMetadataComponent, RowGroupMetadata,
+    ColumnGraph, DataTable, FileSchemaTable, RowGroupColumnMetadataComponent, RowGroupMetadata,
     RowGroupProgressBar, SchemaTreeComponent, ScrollbarComponent,
 };
 use crate::file::Renderable;
@@ -155,7 +156,9 @@ impl<'a> AppWidget<'a> {
             Layout::horizontal([Constraint::Length(title_width), Constraint::Fill(1)]).areas(area);
         self.0.title.bold().fg(Color::Green).render(title_area, buf);
 
-        self.0.tabs().render_instructions(footer_area, buf);
+        self.0
+            .tabs()
+            .render_instructions(footer_area, buf, self.0.state());
     }
 
     fn render_metadata_view(&self, area: Rect, buf: &mut Buffer) {
@@ -256,6 +259,16 @@ impl<'a> AppWidget<'a> {
         // if polars fails to read the file, return error
         if let Some(error) = &self.0.parquet_ctx.sample_data_error {
             return render_sample_data_error(error, area, buf);
+        }
+
+        let state = self.0.state();
+        if state.graph_open() {
+            let sample_data = &self.0.parquet_ctx.sample_data;
+            let column = state.selected_column();
+            return match sample_data.cached_profile(column) {
+                Some(profile) => ColumnGraph::new(&profile, state.graph()).render(area, buf),
+                None => render_loading(&sample_data.flattened_columns[column], area, buf),
+            };
         }
 
         DataTable::new(&self.0.parquet_ctx.sample_data)

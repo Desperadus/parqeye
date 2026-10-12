@@ -1,9 +1,11 @@
+pub mod column_profile;
 pub mod error;
 pub mod metadata;
 pub mod parquet_ctx;
 pub mod row_groups;
 pub mod sample_data;
 pub mod schema;
+pub mod stats;
 pub mod utils;
 
 use std::{env, error::Error, path::PathBuf};

@@ -23,6 +23,7 @@
 **Features**
 
 - **Interactive Data Visualization** - Browse through your Parquet data in a table view with keyboard navigation.
+- **Column Graphs** - Plot the distribution of any column (histogram, density, CDF or top values) with summary statistics and automatic insights.
 - **Schema Explorer** - Inspect column types, nested structures, and field definitions.
 - **File Metadata** - View Parquet file-level metadata including version, created by, encoding stats and more.
 - **Row Group Statistics** - Examine row group-level metadata, statistics, and data distribution across groups.
@@ -36,6 +37,25 @@ Run `parqeye` by providing the path to the `.parquet` file.
 ```
 parqeye <path-to-parquet-file>
 ```
+
+## Column graphs
+
+In the Visualize tab, press `M` for column mode, pick a column with `←`/`→` and press `G` to plot its distribution. Numeric, date/time and decimal columns open as a histogram or a smooth density, text and booleans as top-value bars, and list columns plot the length of each list. The summary panel shows quantiles and points out skew, outliers, zero inflation, multiple peaks and likely ID columns.
+
+| Key | Action |
+| --- | --- |
+| `←` / `→` | Previous / next column |
+| `m`, `1`-`4` | Next view, or Histogram / Density / CDF / Top values |
+| `+` / `-` | More / fewer bins, less / more smoothing |
+| `x` / `y` | Log scale on the x / y axis |
+| `o` | Clip the x range to the 1st-99th percentile |
+| `b` / `a` | Toggle the box plot / the median and mean markers |
+| `s` | Order top values by count or by value |
+| `↑` / `↓` | Scroll the top values list |
+| `r` | Reset the view |
+| `G` / `Esc` | Back to the table |
+
+The graph reads the whole column (only that column) the first time it is opened; later visits reuse the result.
 
 You can also run `parqeye` using `uvx`:
 

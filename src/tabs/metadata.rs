@@ -51,7 +51,7 @@ impl Tab for MetadataTab {
         Ok(())
     }
 
-    fn instructions(&self) -> Vec<Span<'static>> {
+    fn instructions(&self, _state: &AppState) -> Vec<Span<'static>> {
         if self.max_vertical_scroll.map(|n| n > 0).unwrap_or(false) {
             vec![
                 "↑".green(),

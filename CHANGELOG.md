@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Column graphs: `G` in column mode plots the selected column's distribution as a histogram, density, CDF or top values, with log scales, outlier clipping, a box plot and a summary panel with automatic insights
+
 ## [0.2.0]
 
 ### Added

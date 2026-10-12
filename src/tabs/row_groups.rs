@@ -54,7 +54,7 @@ impl Tab for RowGroupsTab {
         Ok(())
     }
 
-    fn instructions(&self) -> Vec<Span<'static>> {
+    fn instructions(&self, _state: &AppState) -> Vec<Span<'static>> {
         vec![
             "→".green(),
             "/".white(),

@@ -1,7 +1,11 @@
 use std::cell::{Ref, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Mutex;
 
 use polars::prelude::*;
+
+use crate::file::column_profile::ColumnProfile;
 
 type LoadedRows = (Vec<Vec<String>>, Vec<String>);
 
@@ -56,6 +60,8 @@ pub struct ParquetSampleData {
     pub total_rows: usize,
     window: RefCell<RowWindow>,
     sorting: RefCell<Option<Sorting>>,
+    /// Whole-column summaries for the graph view, computed once per column.
+    profiles: RefCell<HashMap<usize, Rc<ColumnProfile>>>,
 }
 
 impl ParquetSampleData {
@@ -90,6 +96,7 @@ impl ParquetSampleData {
             total_rows,
             window: RefCell::new(RowWindow { start: 0, rows }),
             sorting: RefCell::new(None),
+            profiles: RefCell::new(HashMap::new()),
         })
     }
 
@@ -256,6 +263,26 @@ impl ParquetSampleData {
         self.window.borrow()
     }
 
+    pub fn cached_profile(&self, column: usize) -> Option<Rc<ColumnProfile>> {
+        self.profiles.borrow().get(&column).cloned()
+    }
+
+    /// Summary of the whole column (reads only that column), cached.
+    pub fn profile(&self, column: usize) -> Rc<ColumnProfile> {
+        if let Some(profile) = self.cached_profile(column) {
+            return profile;
+        }
+        let profile = Rc::new(ColumnProfile::load(
+            &self.file_path,
+            &self.flattened_columns[column],
+            self.total_rows,
+        ));
+        self.profiles
+            .borrow_mut()
+            .insert(column, Rc::clone(&profile));
+        profile
+    }
+
     fn flatten_struct_columns(df: DataFrame) -> DataFrame {
         // Struct columns are currently displayed with their string representation.
         df
@@ -270,7 +297,7 @@ impl ParquetSampleData {
     }
 }
 
-fn catch_polars_panic<T>(
+pub(crate) fn catch_polars_panic<T>(
     operation: impl FnOnce() -> Result<T, Box<dyn std::error::Error>> + std::panic::UnwindSafe,
 ) -> Result<T, Box<dyn std::error::Error>> {
     let _lock = POLARS_PANIC_HOOK_LOCK
